@@ -1,0 +1,205 @@
+---
+title: "N-step random forest"
+author: "Janos Brezniczky"
+date: "19 May 2016"
+output: html_document
+---
+
+```{r "dependencies"}
+# also had to install statmod with
+# install.packages("statmod")
+library(h2o)
+
+set.seed(0) # generic effort for reproducibility
+h2o.init(nthreads = 1) # best effort for reproducibility
+
+h2o.removeAll() # helps re-running, be sure to comment out for a shared server!
+
+```
+
+## A machine learning algorithm to amalgamate GLS and RF
+
+The aim here is to improve on the robustness of the standard Random Forest (RF)
+algorithm for regression in order to better deal with heteroskedasticity and/or 
+unfrequent outliers.
+
+#### Data generating process
+
+Here I will use a simple process and use simulated data. Later analysis may
+deal with more extensive testing and/or real life data.
+
+$y = 5 x_1 + 6 x_2 + \epsilon$
+
+where $\epsilon$ is of normal distribution $(0, sigma^2)$, sigma being a 
+discrete random variable, sampled from 2, 20, and 200, with equal probabilities.
+
+```{r}
+DGP.noise.sd = function(size) {
+  return(x = sample(c(2, 20, 300), size = size, replace = TRUE))
+}
+
+DGP = function(x, noise.sd) {
+  if (missing(noise.sd)) {
+    noise.sd = DGP.noise.sd(nrow(x))
+  }
+  
+  epsilon = rnorm(length(noise.sd), 0, noise.sd)
+  
+  y = 5 * (x[, 1] ^ 2 + 1) * (abs(x[, 2]) + 1) ^ 0.5 + epsilon
+  return(y)
+}
+```
+
+#### Data
+
+```{r}
+n.samples = 2000
+```
+
+`r n.samples` samples are generated with a known noise.
+
+```{r}
+
+x = matrix(ncol = 2, data = runif(n = 2 * n.samples, min = -1, max = 1))
+noise.sd = DGP.noise.sd(size = nrow(x))
+y = DGP(x = x, noise.sd = noise.sd)
+
+is.train = 
+  sample(c(TRUE, FALSE), nrow(x), replace = TRUE, prob = c(0.6, 0.4))
+```
+
+#### Algorithm
+
+The proposed algorithm mimics the behaviour of the iterative n-step GLS combined
+with a random forest available at the time writing in the h2o package. (The 
+feature that neither the standard RF nor xgboost allowed for but required was 
+observation-wise weighting for sampling.)
+
+Actually the algorithm is just a composition of the two concepts - weighted 
+random forest and GLS, where the random forest is meant to replace the OLS part 
+of the GLS method.
+
+```{r}
+WRF.test = function(x, y, weights, is.train) {
+#  browser()
+  set.seed(0) # probably wasted effort at step-wise reproducbility for testing
+  
+  df = data.frame(x, y, wt = weights)
+  colnames(df) <- c("x1", "x2", "y", "wt")
+  
+  df.training = df[is.train, ]
+  df.test = df[!is.train, ]
+
+  h2o.training = as.h2o(df.training, destination_frame = "training_frame")
+  h2o.test = as.h2o(df.test, destination_frame = "test_frame")
+  
+  h2o.rf =
+    h2o.randomForest(
+      x = c("x1", "x2"),
+      y = "y",
+      training_frame = h2o.training,
+      ntrees = 500,
+      weights_column = "wt",
+      nfolds = 2, # TODO: increase
+      score_each_iteration = TRUE,
+      seed = 0, # reproducibility
+      max_depth = 5 # TODO: perhaps increase
+    )
+
+  h2o.backpred = h2o.predict(h2o.rf, newdata = h2o.training)
+  h2o.prediction = h2o.predict(h2o.rf, newdata = h2o.test)
+  
+  vec.backpred = as.data.frame(h2o.backpred)$predict
+  vec.prediction = as.data.frame(h2o.prediction)$predict
+  
+  # cleanup
+  h2o.rm("training_frame")
+  h2o.rm("test_frame")
+  
+  ose = sum(df.test$y - vec.prediction) ^ 2 / nrow(df.test)
+  return(list(backpred = vec.backpred, ose = ose, pred = vec.prediction))
+}
+
+# NSRF = function(n.steps, x, ) {
+#   
+# }
+```
+
+# 1. Unknown heteroskedasticity: n-step convergence
+
+When the algorithm is not informed about the magnitude of the noise...
+
+```{r}
+
+calc.GLS.weights = function(pred, act, n.total.samples, is.train) {
+#  browser()
+  weight = abs((act - pred) ^ -2)
+  # do something about the potential perfectly fitted points, if any
+  weight[act == pred] = max(c(weight[is.finite(weight)], 1)) * 10
+  
+  # weighting seems experimental in h2o RF so prevent seemingly unhandled errors
+  weight = weight / min(weight[weight > 0])
+  
+  # return weights for the entire frame so it 
+  # becomes a suitable input for the RF
+  total.weights = rep(1, n.total.samples)
+  total.weights[is.train] = weight
+
+  return(total.weights)
+}
+
+train.y = y[is.train]
+
+# step 1
+res1 = WRF.test(x = x, y = y, weights = rep(1, length(y)), is.train = is.train)
+
+# step 2
+wt.2 = calc.GLS.weights(res1$backpred, train.y, 
+                        n.total.samples = nrow(x), is.train)
+res2 = WRF.test(x = x, y = y, weights = wt.2, is.train = is.train)
+
+# debug.df = as.data.frame(cbind(cbind(wt.2, y)[is.train, ], pred = res1$backpred))
+# debug.df$se = (debug.df$pred - debug.df$y) ^ 2
+
+# step 3
+wt.3 = calc.GLS.weights(res2$backpred, train.y, 
+                        n.total.samples = nrow(x), is.train)
+res3 = WRF.test(x = x, y = y, weights = wt.3, is.train = is.train)
+
+print(res1$ose)
+print(res2$ose)
+print(res3$ose)
+
+```
+
+With error^-1 weights:
+
+> print(res1$ose)
+[1] 20353.42
+
+> print(res2$ose)
+[1] 965.4304
+
+> print(res3$ose)
+[1] 139.7622
+> 
+
+With error^-2 weights:
+
+> print(res1$ose)
+[1] 20353.42
+
+> print(res2$ose)
+[1] 3937.208
+
+> print(res3$ose)
+[1] 986.1466
+> 
+
+# 2. Known heteroskedasticity
+
+In this test, the algorithm is directly informed about the true per sample 
+deviation values, i.e. the weights are calculated directly from those.
+
+(To be implemented.)
+
